@@ -59,12 +59,26 @@ def normalize_hand(hand_landmarks):
 
 def detect_color_objects(frame):
     """
-    Detects red and blue objects via HSV thresholding.
+    Detects red and blue OBJECTS (boxes) via HSV thresholding.
+
+    Three-stage false-positive rejection to avoid detecting threads, bracelets,
+    clothing patches, or other small/thin coloured items:
+      1. MIN_AREA    : contour must be >= MIN_AREA px² (threads are tiny ~200-800px²)
+      2. ASPECT RATIO: bounding box w/h must be between 0.25-4.0 (threads are very
+                       elongated; a box is roughly square)
+      3. SOLIDITY    : filled_area / convex_hull_area >= 0.50 (threads are sparse
+                       line-like shapes; boxes are solid rectangles)
 
     Returns:
         dict: e.g. {"red": {"center": (cx, cy), "area": float, "box": (x,y,w,h)},
                      "blue": {"center": (cx, cy), "area": float, "box": (x,y,w,h)}}
     """
+    MIN_AREA      = 3000   # px² — rejects threads/bracelets (~200-800px²)
+    MIN_DIMENSION = 30     # px  — both width and height must exceed this
+    MIN_SOLIDITY  = 0.50   # ratio — rejects thin, sparse shapes
+    ASPECT_MIN    = 0.25   # width/height — rejects extreme tall-thin shapes
+    ASPECT_MAX    = 4.00   # width/height — rejects extreme wide-thin shapes
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     detections = {}
 
@@ -73,8 +87,8 @@ def detect_color_objects(frame):
     mask_red2 = cv2.inRange(hsv, np.array([160, 100, 80]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
 
-    # --- BLUE ---
-    mask_blue = cv2.inRange(hsv, np.array([100, 100, 60]), np.array([130, 255, 255]))
+    # --- BLUE / CADBURY SILK PURPLE ---
+    mask_blue = cv2.inRange(hsv, np.array([105, 50, 40]), np.array([155, 255, 255]))
 
     for color_name, mask in [("red", mask_red), ("blue", mask_blue)]:
         # Clean up noise
@@ -83,18 +97,41 @@ def detect_color_objects(frame):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            if area > 500:  # minimum area threshold
-                x, y, w, h = cv2.boundingRect(largest)
-                cx = x + w // 2
-                cy = y + h // 2
-                detections[color_name] = {
-                    "center": (cx, cy),
-                    "area": area,
-                    "box": (x, y, w, h)
-                }
+        if not contours:
+            continue
+
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+
+        # 1. Area gate — threads/bracelets are far too small
+        if area < MIN_AREA:
+            continue
+
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # 2. Minimum dimension — both sides must be substantial
+        if w < MIN_DIMENSION or h < MIN_DIMENSION:
+            continue
+
+        # 3. Aspect ratio — rejects elongated thread/strip shapes
+        aspect = w / (h + 1e-6)
+        if not (ASPECT_MIN <= aspect <= ASPECT_MAX):
+            continue
+
+        # 4. Solidity — rejects sparse line-like shapes (threads score ~0.1-0.3)
+        hull = cv2.convexHull(largest)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1e-6)
+        if solidity < MIN_SOLIDITY:
+            continue
+
+        cx = x + w // 2
+        cy = y + h // 2
+        detections[color_name] = {
+            "center": (cx, cy),
+            "area": area,
+            "box": (x, y, w, h)
+        }
 
     return detections
 

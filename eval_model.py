@@ -20,7 +20,7 @@ from model_def import TARModel, NUM_CLASSES, FEATURE_DIM, SEQ_LEN
 import feature_utils as fu
 from train_tar import load_valid_dataset, FileTARDataset, ArrayTARDataset, DATASET_PATH as TRAIN_DATASET_PATH
 
-DEFAULT_MODEL_PATH = "best_tar_model1.pth" if os.path.exists("best_tar_model1.pth") else "best_tar_model.pth"
+DEFAULT_MODEL_PATH = "best_tar_model.pth"
 
 
 def load_model(path):

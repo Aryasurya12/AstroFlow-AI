@@ -88,7 +88,7 @@ from realtime import (
 # Tip: On Windows, you can right-click any video -> "Copy as path",
 # and simply paste it directly inside the quotes!
 # ==============================================================================
-VIDEO_PATH = r"videos/1.mp4"
+VIDEO_PATH = r"videos\4.mp4"
 
 
 def clean_path(path_str):

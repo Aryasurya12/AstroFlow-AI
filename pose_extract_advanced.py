@@ -158,11 +158,14 @@ def get_yolo_override_boxes(yolo_model, frame):
     return (yolo_red, yolo_blue, yolo_main)
 
 
-# ================= COLOR DETECTION (red/blue sub-boxes fallback) =================
-# Calibrated red ranges: high brightness and saturation, pure red hues (avoids maroon/purple clothing)
-RED_RANGES = [((0, 90, 80), (8, 255, 255)), ((174, 90, 80), (180, 255, 255))]
-BLUE_RANGE = [((85, 55, 40), (160, 255, 255))]
-COLOR_MIN_AREA = 500
+# Calibrated red ranges: strictly matches vivid Lotte Choco Pie scarlet packaging.
+# S >= 155 completely separates scarlet Choco Pie packaging from human skin (skin saturation <= 130).
+RED_RANGES = [((0, 155, 80), (8, 255, 255)), ((170, 155, 80), (180, 255, 255))]
+# Calibrated blue/purple ranges: matches Cadbury Silk purple/violet and royal blue packaging (Hue 95 to 165)
+BLUE_RANGE = [((95, 40, 30), (165, 255, 255))]
+COLOR_MIN_AREA_RED = 1500   # Choco Pie box is substantial; rejects small threads/clothing patches
+COLOR_MIN_AREA_BLUE = 500   # Relaxed so hand grasping occlusion does not discard detection
+COLOR_MIN_AREA = COLOR_MIN_AREA_RED
 
 # ================= SHAPE DETECTION (main box fallback - no reliable color) =================
 MAIN_BOX_MIN_AREA = 3000     # main box should read larger than sub-boxes - tune against your setup
@@ -177,7 +180,7 @@ IOU_EXCLUDE_THRESHOLD = 0.3  # skip shape candidates that overlap a detected sub
 # terminal use.
 DEFAULT_TO_AUTO_MODE = False
 
-AUTO_SAMPLES_PER_LABEL = 15
+AUTO_SAMPLES_PER_LABEL = 5
 AUTO_COUNTDOWN_SEC = 3
 AUTO_RECORD_SEC = 3
 AUTO_REST_SEC = 1.5
@@ -219,14 +222,25 @@ def normalize_hand_landmarks(hand_landmarks):
 
 
 # ================= SHARED CONTOUR SCORING =================
-def _score_contour(cnt, min_area):
+def _score_contour(cnt, min_area, is_red=False):
     area = cv2.contourArea(cnt)
     if area < min_area:
         return None
     x, y, w, h = cv2.boundingRect(cnt)
+    # Box dimensions: must have substantial width and height (threads/folds are too thin)
+    if w < 30 or h < 30:
+        return None
+    ar = w / float(max(1, h))
+    # Red box (Choco Pie) cannot be a tall narrow vertical strip like an arm (ar < 0.55)
+    if is_red and (ar < 0.55 or ar > 2.6):
+        return None
+    elif not is_red and (ar < 0.25 or ar > 4.0):
+        return None
     hull = cv2.convexHull(cnt)
     hull_area = cv2.contourArea(hull) if hull is not None else 0
     solidity = (area / hull_area) if hull_area > 0 else 0
+    if solidity < 0.45:  # Rejects thin curved threads or sparse sleeve folds
+        return None
     peri = cv2.arcLength(cnt, True)
     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
     approx_ok = len(approx) == 4
@@ -234,13 +248,11 @@ def _score_contour(cnt, min_area):
     return {"rect": (x, y, w, h), "area": area, "solidity": solidity, "approx_ok": approx_ok, "score": score}
 
 
-def _best_from_mask(mask, min_area):
+def _candidates_from_mask(mask, min_area, is_red=False):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = [c for c in (_score_contour(cnt, min_area) for cnt in contours) if c is not None]
-    if not candidates:
-        return None
+    candidates = [c for c in (_score_contour(cnt, min_area, is_red=is_red) for cnt in contours) if c is not None]
     candidates.sort(key=lambda c: -c["score"])
-    return candidates[0]
+    return candidates
 
 
 # ================= COLOR-BASED SUB-BOX DETECTION =================
@@ -282,28 +294,22 @@ def get_body_exclusion_mask(pose_landmarks, frame_shape):
     lms = pose_landmarks.landmark
     mask = np.ones((h, w), dtype=np.uint8) * 255
 
-    # 1. Torso exclusion (shoulders down to hips)
-    if len(lms) > 24:
-        torso_pts = np.array([
-            [int(lms[11].x * w), int(lms[11].y * h)],
-            [int(lms[12].x * w), int(lms[12].y * h)],
-            [int(lms[24].x * w), int(lms[24].y * h)],
-            [int(lms[23].x * w), int(lms[23].y * h)]
-        ], dtype=np.int32)
-        cv2.fillConvexPoly(mask, torso_pts, 0)
+    # 1. Full Body Column exclusion (masks head, neck, torso, shirt, sleeves, and lap)
+    shoulder_y = int(min(lms[11].y, lms[12].y) * h)
+    body_xs = [lms[i].x * w for i in [11, 12, 13, 14] if lms[i].visibility > 0.1]
+    if not body_xs:
+        body_xs = [lms[11].x * w, lms[12].x * w]
+    body_left = max(0, int(min(body_xs)) - 100)
+    body_right = min(w, int(max(body_xs)) + 100)
 
-        # Re-include region around wrists (in case holding an object in front of torso)
-        lw = (int(lms[15].x * w), int(lms[15].y * h))
-        rw = (int(lms[16].x * w), int(lms[16].y * h))
-        cv2.circle(mask, lw, 140, 255, -1)
-        cv2.circle(mask, rw, 140, 255, -1)
+    # Mask entire person: head/neck down to the bottom of the frame
+    cv2.rectangle(mask, (0, 0), (w, max(0, shoulder_y - 20)), 0, -1)
+    cv2.rectangle(mask, (body_left, max(0, shoulder_y - 30)), (body_right, h), 0, -1)
 
-    # 2. Above-shoulder exclusion (anything above chest level is NOT a desk box)
-    shoulder_y = min(lms[11].y, lms[12].y) * h
-    if shoulder_y > 0:
-        cv2.rectangle(mask, (0, 0), (w, int(shoulder_y * 0.95)), 0, -1)
-    else:
-        cv2.rectangle(mask, (0, 0), (w, int(h * 0.42)), 0, -1)
+    # 2. Upper arm exclusion (keep hands/wrists unmasked so held boxes are not destroyed)
+    if len(lms) > 16:
+        cv2.line(mask, (int(lms[11].x * w), int(lms[11].y * h)), (int(lms[13].x * w), int(lms[13].y * h)), 0, 110)
+        cv2.line(mask, (int(lms[12].x * w), int(lms[12].y * h)), (int(lms[14].x * w), int(lms[14].y * h)), 0, 110)
 
     # 3. Face & head exclusion (landmarks 0 to 10: nose, eyes, ears, mouth)
     face_x = [lms[i].x * w for i in range(11)]
@@ -325,31 +331,55 @@ def detect_color_boxes(frame, exclusion_mask=None, pose_landmarks=None):
     if exclusion_mask is not None:
         red_mask = cv2.bitwise_and(red_mask, red_mask, mask=exclusion_mask)
         blue_mask = cv2.bitwise_and(blue_mask, blue_mask, mask=exclusion_mask)
-    red = _best_from_mask(red_mask, COLOR_MIN_AREA)
-    blue = _best_from_mask(blue_mask, COLOR_MIN_AREA)
 
-    # Physical sanity check: A desk box in the upper 40% of the screen (head level)
-    # can ONLY exist if a hand is actively holding it up. Otherwise it's impossible.
+    red_candidates = _candidates_from_mask(red_mask, COLOR_MIN_AREA_RED, is_red=True)
+    blue_candidates = _candidates_from_mask(blue_mask, COLOR_MIN_AREA_BLUE, is_red=False)
+
     h, w = frame.shape[:2]
     face_limit_y = int(h * 0.38)
-    for b_idx, b in enumerate([red, blue]):
-        if b is not None and b["rect"][1] < face_limit_y:
-            wrist_near = False
+
+    def _filter_best(candidates, is_red=False):
+        for b in candidates:
+            bx, by, bw, bh = b["rect"]
+            ar = bw / float(max(1, bh))
+
+            # Strictly reject vertical elongated shapes for red box (human arm)
+            if is_red and ar < 0.55:
+                continue
+
+            # Wrist thread / forearm rejection
             if pose_landmarks is not None and len(pose_landmarks.landmark) > 16:
                 lms = pose_landmarks.landmark
-                cx = b["rect"][0] + b["rect"][2] / 2.0
-                cy = b["rect"][1] + b["rect"][3] / 2.0
-                for wi in (15, 16):
-                    wx, wy = lms[wi].x * w, lms[wi].y * h
-                    if np.hypot(cx - wx, cy - wy) < 160:
-                        wrist_near = True
+                bcx = bx + bw / 2.0
+                bcy = by + bh / 2.0
+                near_arm = False
+                for wi in (13, 14, 15, 16):
+                    if np.hypot(bcx - lms[wi].x * w, bcy - lms[wi].y * h) < 75:
+                        near_arm = True
                         break
-            if not wrist_near:
-                if b_idx == 0:
-                    red = None
-                else:
-                    blue = None
+                if near_arm and is_red and (ar < 0.65 or b["area"] > 10000):
+                    continue
 
+            # Upper 38% screen check (floating at head level without hand)
+            if by < face_limit_y:
+                wrist_near = False
+                if pose_landmarks is not None and len(pose_landmarks.landmark) > 16:
+                    lms = pose_landmarks.landmark
+                    cx = bx + bw / 2.0
+                    cy = by + bh / 2.0
+                    for wi in (15, 16):
+                        wx, wy = lms[wi].x * w, lms[wi].y * h
+                        if np.hypot(cx - wx, cy - wy) < 160:
+                            wrist_near = True
+                            break
+                if not wrist_near:
+                    continue
+
+            return b
+        return None
+
+    red = _filter_best(red_candidates, is_red=True)
+    blue = _filter_best(blue_candidates, is_red=False)
     return red, blue
 
 
@@ -758,7 +788,7 @@ def main():
 
 
 # ================= AUTO MODE (python pose_extract_advanced.py --auto) =================
-def main_auto():
+def main_auto(samples_per_label=AUTO_SAMPLES_PER_LABEL):
     """
     Single-loop COUNTDOWN -> RECORD -> REST state machine - hands-free
     once started, cycling through all actions automatically.
@@ -797,7 +827,7 @@ def main_auto():
     last_saved_label_idx = None
     boxes = None
 
-    print(f"[AutoCollector] {AUTO_SAMPLES_PER_LABEL} samples x {len(ACTIONS)} actions")
+    print(f"[AutoCollector] {samples_per_label} samples x {len(ACTIONS)} actions")
     print("Q = quit | R = redo (deletes the last saved sample for this label if any)\n")
     print(f"NEXT ACTION: {ACTIONS[label_idx][1]}")
 
@@ -901,7 +931,7 @@ def main_auto():
             cv2.putText(frame, "Rest...", (30, 130),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.1, (200, 200, 200), 3)
             if elapsed >= AUTO_REST_SEC:
-                if sample_count >= AUTO_SAMPLES_PER_LABEL:
+                if sample_count >= samples_per_label:
                     label_idx += 1
                     sample_count = 0
                     if label_idx >= len(ACTIONS):
@@ -933,7 +963,7 @@ def main_auto():
 
         cv2.putText(frame, f"Action: {current_label_name}", (30, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        cv2.putText(frame, f"Sample: {sample_count}/{AUTO_SAMPLES_PER_LABEL}", (30, 75),
+        cv2.putText(frame, f"Sample: {sample_count}/{samples_per_label}", (30, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
         cv2.putText(frame, f"Mode: {mode}", (30, 105),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -966,11 +996,13 @@ def main_auto():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Advanced Pose & Object Feature Extractor")
     parser.add_argument("--auto", action="store_true",
                          help="Run the automated countdown/record/rest collector")
     parser.add_argument("--manual", action="store_true",
                          help="Force manual mode, overriding DEFAULT_TO_AUTO_MODE")
+    parser.add_argument("--samples", "--reps", type=int, default=AUTO_SAMPLES_PER_LABEL,
+                         help="Number of repetitions per action in auto mode (default: 5)")
     args, _unknown = parser.parse_known_args()  # ignore unrecognized args an IDE might inject
 
     if args.manual:
@@ -981,5 +1013,5 @@ if __name__ == "__main__":
         run_auto = DEFAULT_TO_AUTO_MODE
 
     print(f"[Launch] mode={'AUTO' if run_auto else 'MANUAL'}  "
-          f"(DEFAULT_TO_AUTO_MODE={DEFAULT_TO_AUTO_MODE}, --auto={args.auto}, --manual={args.manual})")
-    main_auto() if run_auto else main()
+          f"(DEFAULT_TO_AUTO_MODE={DEFAULT_TO_AUTO_MODE}, --auto={args.auto}, --manual={args.manual}, reps={args.samples})")
+    main_auto(samples_per_label=args.samples) if run_auto else main()

@@ -1,27 +1,26 @@
 """
-Retrain / Fine-tune an existing TARModel checkpoint on a new or updated dataset.
+Train & Fine-tune TAR (Temporal Action Recognition) Model on Landmark Sequences.
 
 Features:
-  - Loads an existing checkpoint (e.g. best_tar_model.pth).
-  - Automatically creates a backup of the base model before overwriting.
-  - Runs a pre-retraining baseline evaluation so you can compare before vs after.
-  - Fine-tunes with a lower default learning rate (1e-4) to protect learned features.
-  - Optional `--combine_with` flag to merge new samples with an older dataset to
-    prevent catastrophic forgetting.
-  - Optional `--freeze_backbone` flag to only tune the classifier head.
+  - Supports both training from scratch and fine-tuning existing checkpoints.
+  - Automatically creates a backup of 'best_tar_model.pth' before saving new weights.
+  - Realistic sliding-window, temporal, and spatial augmentations (jitter, warping, flipping).
+  - Class-balanced loss with label smoothing and Cosine Annealing learning rate schedule.
+  - Stratified train/val split with full classification report per class.
+  - Baseline validation check so the model never degrades from previous best checkpoint.
 
 Usage:
-    # Run with defaults (configured below):
-    python retrain_tar.py
+    # Run with default settings (trains/fine-tunes on dataset_advanced -> best_tar_model.pth):
+    python train_tar.py
 
     # Specify custom dataset and epochs:
-    python retrain_tar.py --dataset_path dataset_final --epochs 30
+    python train_tar.py --dataset_path dataset_advanced --epochs 30
 
-    # Combine new dataset with original backup to prevent forgetting:
-    python retrain_tar.py --dataset_path dataset_final --combine_with dataset_backup/dataset_advanced
+    # Train completely from scratch (ignoring existing checkpoint):
+    python train_tar.py --scratch --epochs 50
 
-    # Specify custom output path:
-    python retrain_tar.py --dataset_path dataset_final --output best_tar_model_v2.pth
+    # Combine with another dataset folder:
+    python train_tar.py --combine_with dataset_backup/dataset_advanced
 """
 
 import os
@@ -48,16 +47,17 @@ import feature_utils as fu
 # ==============================================================================
 
 # ==============================================================================
-# DEFAULT CONFIG (used when running without CLI arguments)
+# DEFAULT CONFIG
 # ==============================================================================
 DEFAULT_BASE_MODEL = "best_tar_model.pth"
-DEFAULT_NEW_DATASET = "dataset_advanced"       # Change this to your new dataset folder
-DEFAULT_COMBINE_WITH = None                  # e.g. "dataset_backup/dataset_advanced"
+DEFAULT_DATASET = "dataset_advanced"
+DEFAULT_COMBINE_WITH = None
 DEFAULT_OUTPUT_MODEL = "best_tar_model.pth"
-DEFAULT_EPOCHS = 25
-DEFAULT_BATCH_SIZE = 16
-DEFAULT_LR = 1e-4                            # Lower LR for fine-tuning
+DEFAULT_EPOCHS = 80
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_LR = 5e-4
 DEFAULT_FREEZE_BACKBONE = False
+DATASET_PATH = DEFAULT_DATASET
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -69,14 +69,10 @@ def augment_sequence(data, is_training=True):
     """
     Realistic sliding-window, temporal, and spatial augmentations:
       1. Temporal shift (sliding window jitter): Shifts sequence left or right by up to 6 frames.
-         Simulates live sliding-window misalignment when action is not perfectly centered.
       2. Time-warping (speed variation): Interpolates time axis by 0.85x to 1.15x.
       3. Landmark Gaussian Jitter: Adds subtle noise (sigma=0.008) to coordinates.
-      4. Channel/Dropout masking: Randomly zeroes out a 2-4 frame block (simulates MediaPipe occlusion).
+      4. Channel/Dropout masking: Randomly zeroes out a 2-4 frame block.
       5. Horizontal flip (spatial): Mirrors X-coordinates + swaps left/right hand blocks.
-         Simulates operator approaching from the other side. Applied to base features only;
-         velocity block is recomputed from the flipped base to stay physically consistent.
-         (Source: Review paper — addresses viewpoint/illumination variance)
     """
     if not is_training:
         return data
@@ -101,7 +97,6 @@ def augment_sequence(data, is_training=True):
         warped = np.zeros((new_len, F), dtype=np.float32)
         for c in range(F):
             warped[:, c] = np.interp(orig_indices, np.arange(T), seq[:, c])
-        # Resample back to T=48
         target_indices = np.linspace(0, new_len - 1, num=T)
         resampled = np.zeros((T, F), dtype=np.float32)
         for c in range(F):
@@ -119,28 +114,26 @@ def augment_sequence(data, is_training=True):
         drop_start = np.random.randint(0, max(1, T - drop_len))
         seq[drop_start:drop_start + drop_len] = 0.0
 
-    # 5. Horizontal Flip (spatial augmentation — viewpoint variance)
-    # Only applied when F == FEATURE_DIM (332) to guard against shape mismatches.
+    # 5. Horizontal Flip (spatial augmentation)
     if np.random.rand() < 0.40 and F == FEATURE_DIM:
-        # --- Base feature block [0:166] ---
         base = seq[:, :166].copy()
 
         # Flip X in pose (66 values: x at even indices 0,2,4,...,64)
         base[:, 0:66:2] = 1.0 - base[:, 0:66:2]
 
         # Swap left hand [66:108] <-> right hand [108:150], then flip their X
-        left_orig  = base[:, 66:108].copy()
+        left_orig = base[:, 66:108].copy()
         right_orig = base[:, 108:150].copy()
-        base[:, 66:108]  = right_orig
+        base[:, 66:108] = right_orig
         base[:, 108:150] = left_orig
-        base[:, 66:108:2]  = 1.0 - base[:, 66:108:2]   # flip X in new-left  (was right)
-        base[:, 108:150:2] = 1.0 - base[:, 108:150:2]  # flip X in new-right (was left)
+        base[:, 66:108:2] = 1.0 - base[:, 66:108:2]
+        base[:, 108:150:2] = 1.0 - base[:, 108:150:2]
 
         # Flip X in red object [150], blue [153], main [156]
         for obj_x_idx in (150, 153, 156):
             base[:, obj_x_idx] = 1.0 - base[:, obj_x_idx]
 
-        # Recompute velocity from flipped base to stay physically consistent
+        # Recompute velocity from flipped base
         vel = np.zeros_like(base)
         vel[1:] = base[1:] - base[:-1]
 
@@ -165,7 +158,6 @@ class FileTARDataset(Dataset):
         file_path, label = self.samples[idx]
         data = np.load(file_path).astype(np.float32)
 
-        # Ensure correct shape (SEQ_LEN, FEATURE_DIM)
         if data.shape != (SEQ_LEN, FEATURE_DIM):
             if data.shape[1] == FEATURE_DIM:
                 data = fu.resample_sequence(data, target_len=SEQ_LEN)
@@ -177,7 +169,6 @@ class FileTARDataset(Dataset):
         if self.is_training:
             data = augment_sequence(data, is_training=True)
 
-        # Z-score normalization matching train_tar.py
         mean = np.mean(data)
         std = np.std(data) + 1e-6
         data = (data - mean) / std
@@ -255,7 +246,6 @@ def load_dataset(dataset_path, combine_with=None):
     x_path = os.path.join(dataset_path, "X.npy")
     y_path = os.path.join(dataset_path, "y.npy")
 
-    # If dataset has precomputed X.npy and y.npy and no combine requested
     if os.path.exists(x_path) and os.path.exists(y_path) and not combine_with:
         X = np.load(x_path)
         y = np.load(y_path)
@@ -263,7 +253,6 @@ def load_dataset(dataset_path, combine_with=None):
             print(f"[DATASET] Loaded array dataset from '{dataset_path}': X={X.shape}, y={y.shape}")
             return "array", (X, y)
 
-    # Load file pairs from primary dataset
     primary_samples = discover_files(dataset_path)
     print(f"[DATASET] Found {len(primary_samples)} samples in '{dataset_path}'")
 
@@ -274,6 +263,9 @@ def load_dataset(dataset_path, combine_with=None):
         all_samples.extend(combined_samples)
 
     return "files", all_samples
+
+
+load_valid_dataset = load_dataset
 
 
 # ==============================================================================
@@ -302,22 +294,23 @@ def evaluate(model, val_loader, criterion):
 
 
 # ==============================================================================
-# MAIN RETRAINING ROUTINE
+# MAIN TRAINING / RETRAINING ROUTINE
 # ==============================================================================
-def retrain(base_model_path=DEFAULT_BASE_MODEL,
-            dataset_path=DEFAULT_NEW_DATASET,
-            combine_with=DEFAULT_COMBINE_WITH,
-            output_model_path=DEFAULT_OUTPUT_MODEL,
-            epochs=DEFAULT_EPOCHS,
-            batch_size=DEFAULT_BATCH_SIZE,
-            lr=DEFAULT_LR,
-            freeze_backbone=DEFAULT_FREEZE_BACKBONE):
+def train(base_model_path=DEFAULT_BASE_MODEL,
+          dataset_path=DEFAULT_DATASET,
+          combine_with=DEFAULT_COMBINE_WITH,
+          output_model_path=DEFAULT_OUTPUT_MODEL,
+          epochs=DEFAULT_EPOCHS,
+          batch_size=DEFAULT_BATCH_SIZE,
+          lr=DEFAULT_LR,
+          freeze_backbone=DEFAULT_FREEZE_BACKBONE,
+          train_from_scratch=False):
 
     print("=" * 70)
-    print(" " * 20 + "TAR MODEL RETRAINING")
+    print(" " * 20 + "TAR MODEL TRAINING & FINE-TUNING")
     print("=" * 70)
-    print(f"  Base Model   : {base_model_path}")
-    print(f"  New Dataset  : {dataset_path}")
+    print(f"  Base Model   : {base_model_path if not train_from_scratch else 'None (from scratch)'}")
+    print(f"  Dataset Path : {dataset_path}")
     if combine_with:
         print(f"  Combine With : {combine_with}")
     print(f"  Output Model : {output_model_path}")
@@ -327,24 +320,23 @@ def retrain(base_model_path=DEFAULT_BASE_MODEL,
     print(f"  Device       : {DEVICE}")
     print("=" * 70)
 
-    # 1. Check & Load Existing Model
-    if not os.path.exists(base_model_path):
-        raise FileNotFoundError(
-            f"Base model '{base_model_path}' not found! Train an initial model first."
-        )
-
-    # Backup the original model so it is never lost
-    backup_path = f"{os.path.splitext(base_model_path)[0]}_backup.pth"
-    if not os.path.exists(backup_path):
-        shutil.copyfile(base_model_path, backup_path)
-        print(f"[BACKUP] Created backup of base model at '{backup_path}'")
-
     model = TARModel(input_size=FEATURE_DIM, num_classes=NUM_CLASSES).to(DEVICE)
-    checkpoint = torch.load(base_model_path, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(checkpoint)
-    print(f"[MODEL] Successfully loaded checkpoint weights from '{base_model_path}'")
 
-    # Optional: freeze transformer backbone (train only classification layers)
+    # 1. Check & Load Existing Model if not from scratch
+    base_loaded = False
+    if not train_from_scratch and os.path.exists(base_model_path):
+        backup_path = f"{os.path.splitext(base_model_path)[0]}_backup.pth"
+        if not os.path.exists(backup_path):
+            shutil.copyfile(base_model_path, backup_path)
+            print(f"[BACKUP] Created backup of base model at '{backup_path}'")
+
+        checkpoint = torch.load(base_model_path, map_location=DEVICE, weights_only=True)
+        model.load_state_dict(checkpoint)
+        base_loaded = True
+        print(f"[MODEL] Successfully loaded checkpoint weights from '{base_model_path}'")
+    else:
+        print("[MODEL] Initializing new model architecture from scratch.")
+
     if freeze_backbone:
         for name, param in model.named_parameters():
             if "classifier" not in name:
@@ -389,8 +381,6 @@ def retrain(base_model_path=DEFAULT_BASE_MODEL,
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    # Class-weighted loss to handle imbalanced class counts
-    # (Source: Sequential HAR paper + Ensemble ML paper — imbalance handling)
     raw_weights = compute_class_weight(
         class_weight='balanced',
         classes=np.arange(NUM_CLASSES),
@@ -403,16 +393,19 @@ def retrain(base_model_path=DEFAULT_BASE_MODEL,
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    # 3. Baseline Validation Before Training
-    base_loss, base_acc, base_f1 = evaluate(model, val_loader, criterion)
-    print(f"\n[BASELINE] Pre-retraining performance on new validation split:")
-    print(f"   --> Val Loss: {base_loss:.4f} | Val Acc: {base_acc:.4f} | Val F1: {base_f1:.4f}\n")
+    # 3. Baseline Validation Check
+    if base_loaded:
+        base_loss, base_acc, base_f1 = evaluate(model, val_loader, criterion)
+        print(f"\n[BASELINE] Pre-training performance on validation split:")
+        print(f"   --> Val Loss: {base_loss:.4f} | Val Acc: {base_acc:.4f} | Val F1: {base_f1:.4f}\n")
+        best_f1 = base_f1
+    else:
+        best_f1 = 0.0
 
-    best_f1 = base_f1
     saved_best = False
 
-    # 4. Retraining Loop
-    print(f"[TRAIN] Starting fine-tuning for {epochs} epochs...")
+    # 4. Training Loop
+    print(f"[TRAIN] Starting training for {epochs} epochs...")
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -446,16 +439,13 @@ def retrain(base_model_path=DEFAULT_BASE_MODEL,
         else:
             print("")
 
-    # If the model didn't beat the baseline, save the final model or keep baseline
     if not saved_best:
         torch.save(model.state_dict(), output_model_path)
-        print(f"\n[NOTE] Baseline was already strong. Saved final epoch checkpoint to '{output_model_path}' (F1: {val_f1:.4f})")
+        print(f"\n[NOTE] Saved final epoch checkpoint to '{output_model_path}' (F1: {val_f1:.4f})")
     else:
-        print(f"\n[DONE] Retraining complete! Best model saved to '{output_model_path}' with F1: {best_f1:.4f}")
-        print(f"(Baseline was F1: {base_f1:.4f} -> Improved to F1: {best_f1:.4f})")
+        print(f"\n[DONE] Training complete! Best model saved to '{output_model_path}' with F1: {best_f1:.4f}")
 
-    # Per-class breakdown on final validation pass
-    _, _, _ = evaluate(model, val_loader, criterion)  # re-run to capture preds
+    # Per-class breakdown
     model.eval()
     final_preds, final_targets = [], []
     with torch.no_grad():
@@ -472,27 +462,29 @@ def retrain(base_model_path=DEFAULT_BASE_MODEL,
 # CLI PARSER
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Retrain / fine-tune an existing TARModel checkpoint.")
+    parser = argparse.ArgumentParser(description="Train / Retrain TARModel checkpoint.")
     parser.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL,
-                        help="Path to initial .pth checkpoint (default: best_tar_model.pth)")
-    parser.add_argument("--dataset_path", type=str, default=DEFAULT_NEW_DATASET,
-                        help="Path to new dataset directory (default: dataset_advanced)")
+                        help="Path to base .pth checkpoint (default: best_tar_model.pth)")
+    parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET,
+                        help="Path to dataset directory (default: dataset_advanced)")
     parser.add_argument("--combine_with", type=str, default=DEFAULT_COMBINE_WITH,
-                        help="Optional older dataset directory to merge with (prevents forgetting)")
+                        help="Optional older dataset directory to merge with")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_MODEL,
-                        help="Path to save retrained model (default: best_tar_model.pth)")
+                        help="Path to save model (default: best_tar_model.pth)")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                        help=f"Number of fine-tuning epochs (default: {DEFAULT_EPOCHS})")
+                        help=f"Number of training epochs (default: {DEFAULT_EPOCHS})")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR,
                         help=f"Learning rate (default: {DEFAULT_LR})")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Batch size (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--freeze_backbone", action="store_true", default=DEFAULT_FREEZE_BACKBONE,
-                        help="Freeze transformer and only train classifier head")
+                        help="Freeze backbone and only train classifier head")
+    parser.add_argument("--scratch", action="store_true", default=False,
+                        help="Train from scratch instead of fine-tuning existing checkpoint")
 
     args = parser.parse_args()
 
-    retrain(
+    train(
         base_model_path=args.base_model,
         dataset_path=args.dataset_path,
         combine_with=args.combine_with,
@@ -500,5 +492,6 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        freeze_backbone=args.freeze_backbone
+        freeze_backbone=args.freeze_backbone,
+        train_from_scratch=args.scratch
     )

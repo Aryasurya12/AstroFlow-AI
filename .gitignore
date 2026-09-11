@@ -13,26 +13,31 @@ __pycache__/
 .pytest_cache/
 
 # Pipeline frame extractions & large image dumps
-yolo_pipeline/raw_frames/
-yolo_pipeline/annotated/
-yolo_pipeline/dataset/
-yolo_pipeline/runs/
-tar_pipeline/raw_clips/
-tar_pipeline/annotated_clips/
+yolo_pipeline/
+tar_pipeline/
+dataset/
+dataset_advanced/
+videos/
+session_logs/
+test_reports/
+implementation_plan.md
+
+# Large pretrained/fold weights (keep best_tar_model.pth and yolo_boxes.pt)
+fold_*_model.pth
+yolov8s.pt
 
 # Data quarantine & feedback logs
 dataset_quarantine/
 feedback_data/
+dataset_clean_report.*
 *.log
+*.mp4
+*.avi
+*.mov
 
 # Model backups
 *_backup.pth
 best_tar_model1.pth
-
-# Reports & exports
-test_reports/*.json
-test_reports/*.png
-dataset_clean_report.*
 
 # IDE & OS files
 .vscode/
@@ -40,6 +45,3 @@ dataset_clean_report.*
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Output test recordings
-output_*.mp4
