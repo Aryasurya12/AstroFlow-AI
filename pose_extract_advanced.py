@@ -161,10 +161,10 @@ def get_yolo_override_boxes(yolo_model, frame):
 # Calibrated red ranges: strictly matches vivid Lotte Choco Pie scarlet packaging.
 # S >= 155 completely separates scarlet Choco Pie packaging from human skin (skin saturation <= 130).
 RED_RANGES = [((0, 155, 80), (8, 255, 255)), ((170, 155, 80), (180, 255, 255))]
-# Calibrated blue/purple ranges: matches Cadbury Silk purple/violet and royal blue packaging (Hue 95 to 165)
-BLUE_RANGE = [((95, 40, 30), (165, 255, 255))]
+# Calibrated blue/purple ranges: matches Cadbury Silk purple/violet and royal blue packaging (Hue 95 to 170)
+BLUE_RANGE = [((95, 30, 25), (170, 255, 255))]
 COLOR_MIN_AREA_RED = 1500   # Choco Pie box is substantial; rejects small threads/clothing patches
-COLOR_MIN_AREA_BLUE = 500   # Relaxed so hand grasping occlusion does not discard detection
+COLOR_MIN_AREA_BLUE = 800    # Solid Cadbury Silk box; rejects tiny reflections
 COLOR_MIN_AREA = COLOR_MIN_AREA_RED
 
 # ================= SHAPE DETECTION (main box fallback - no reliable color) =================
@@ -329,8 +329,8 @@ def detect_color_boxes(frame, exclusion_mask=None, pose_landmarks=None):
     red_mask = _clean_mask(_mask_from_ranges(hsv, RED_RANGES))
     blue_mask = _clean_mask(_mask_from_ranges(hsv, BLUE_RANGE))
     if exclusion_mask is not None:
+        # ONLY apply body exclusion mask to red (skin/lips/torso). Never apply to blue/purple!
         red_mask = cv2.bitwise_and(red_mask, red_mask, mask=exclusion_mask)
-        blue_mask = cv2.bitwise_and(blue_mask, blue_mask, mask=exclusion_mask)
 
     red_candidates = _candidates_from_mask(red_mask, COLOR_MIN_AREA_RED, is_red=True)
     blue_candidates = _candidates_from_mask(blue_mask, COLOR_MIN_AREA_BLUE, is_red=False)
@@ -342,6 +342,11 @@ def detect_color_boxes(frame, exclusion_mask=None, pose_landmarks=None):
         for b in candidates:
             bx, by, bw, bh = b["rect"]
             ar = bw / float(max(1, bh))
+
+            # Reject extreme edge slivers (shelves, door frames on room boundaries)
+            if not is_red:
+                if (bx > w - 75 and bw < 65) or (bx < 25 and bw < 50):
+                    continue
 
             # Strictly reject vertical elongated shapes for red box (human arm)
             if is_red and ar < 0.55:
@@ -360,8 +365,26 @@ def detect_color_boxes(frame, exclusion_mask=None, pose_landmarks=None):
                 if near_arm and is_red and (ar < 0.65 or b["area"] > 10000):
                     continue
 
-            # Upper 38% screen check (floating at head level without hand)
-            if by < face_limit_y:
+            # Workspace Distance & Horizon Limit: reject distant background objects
+            if (by + bh) < int(h * 0.28):
+                continue
+
+            # Reachability Limit: Object must be within reachable human interaction range
+            if pose_landmarks is not None and len(pose_landmarks.landmark) > 16:
+                lms = pose_landmarks.landmark
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+                wrist_dist_px = min(
+                    np.hypot(cx - lms[15].x * w, cy - lms[15].y * h),
+                    np.hypot(cx - lms[16].x * w, cy - lms[16].y * h)
+                )
+                diag = np.hypot(w, h)
+                if (wrist_dist_px / diag) > 0.68:
+                    continue
+
+            # Upper 38% screen check: if candidate has solid area (>= 3000 px), it is a real held box shown to camera!
+            # Only tiny shapes (< 3000 px) in the top 38% need strict wrist proximity to reject ceiling lights.
+            if by < face_limit_y and b["area"] < 3000:
                 wrist_near = False
                 if pose_landmarks is not None and len(pose_landmarks.landmark) > 16:
                     lms = pose_landmarks.landmark
@@ -369,7 +392,7 @@ def detect_color_boxes(frame, exclusion_mask=None, pose_landmarks=None):
                     cy = by + bh / 2.0
                     for wi in (15, 16):
                         wx, wy = lms[wi].x * w, lms[wi].y * h
-                        if np.hypot(cx - wx, cy - wy) < 160:
+                        if np.hypot(cx - wx, cy - wy) < 220:
                             wrist_near = True
                             break
                 if not wrist_near:
@@ -512,12 +535,19 @@ def extract_base_features(pose_res, hand_res, frame, override_boxes=None):
         blue = o_blue
         main = o_main
 
-    # 3. Fallback to HSV / edge detector ONLY if YOLO missed a box (with face/body strictly masked out)
-    if red is None or blue is None:
-        hsv_red, hsv_blue = detect_color_boxes(frame, exclusion_mask=body_mask, pose_landmarks=pose_landmarks_obj)
-        if red is None:
-            red = hsv_red
-        if blue is None:
+    # 3. Run color detection for reliable sub-box localization:
+    # Cadbury Silk purple has distinct packaging color. If HSV finds a solid purple box (area >= 1200),
+    # prefer it over YOLO's noisy/oversized boxes!
+    hsv_red, hsv_blue = detect_color_boxes(frame, exclusion_mask=body_mask, pose_landmarks=pose_landmarks_obj)
+    if red is None:
+        red = hsv_red
+    elif hsv_red is not None and red.get("score", 1.0) < 0.35:
+        red = hsv_red
+
+    if blue is None:
+        blue = hsv_blue
+    elif hsv_blue is not None:
+        if blue.get("area", 0) > 40000 or blue.get("score", 1.0) < 0.40 or hsv_blue["area"] > 2500:
             blue = hsv_blue
 
     edge_debug = None

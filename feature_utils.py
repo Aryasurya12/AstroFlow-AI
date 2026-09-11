@@ -73,7 +73,7 @@ def detect_color_objects(frame):
         dict: e.g. {"red": {"center": (cx, cy), "area": float, "box": (x,y,w,h)},
                      "blue": {"center": (cx, cy), "area": float, "box": (x,y,w,h)}}
     """
-    MIN_AREA      = 3000   # px² — rejects threads/bracelets (~200-800px²)
+    MIN_AREA      = 1000   # px² — rejects threads/bracelets (~200-800px²)
     MIN_DIMENSION = 30     # px  — both width and height must exceed this
     MIN_SOLIDITY  = 0.50   # ratio — rejects thin, sparse shapes
     ASPECT_MIN    = 0.25   # width/height — rejects extreme tall-thin shapes
@@ -88,7 +88,7 @@ def detect_color_objects(frame):
     mask_red = mask_red1 | mask_red2
 
     # --- BLUE / CADBURY SILK PURPLE ---
-    mask_blue = cv2.inRange(hsv, np.array([105, 50, 40]), np.array([155, 255, 255]))
+    mask_blue = cv2.inRange(hsv, np.array([95, 30, 25]), np.array([170, 255, 255]))
 
     for color_name, mask in [("red", mask_red), ("blue", mask_blue)]:
         # Clean up noise

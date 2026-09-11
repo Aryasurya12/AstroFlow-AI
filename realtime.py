@@ -60,8 +60,8 @@ except Exception:
     def play_sound(freq=1200, dur=70):
         pass
 
-MODEL_PATH = "best_tar_model.pth"
-YOLO_MODEL_PATH = "yolo_boxes.pt"
+MODEL_PATH = "models/best_tar_model.pth" if os.path.exists("models/best_tar_model.pth") else "best_tar_model.pth"
+YOLO_MODEL_PATH = "models/yolo_boxes.pt" if os.path.exists("models/yolo_boxes.pt") else "yolo_boxes.pt"
 CAMERA_ID = 0
 VIDEO_OUTPUT_DIR = "videos"
 
@@ -85,6 +85,7 @@ CLASS_CONF_THRESHOLDS = {
     "pick_blue": 0.46,
     "place_blue_in": 0.45,
     "close_box": 0.45,
+
 }
 
 
@@ -147,15 +148,17 @@ class SessionVideoRecorder:
         self.segments = []
         self.current_segment_label = "idle"
         self.current_segment_start = 0
-        ts_print(f"[REC] Recording clean session video to: {self.video_path} ({self.fps:.1f} FPS)")
+        ts_print(f"[REC] Recording session video to: {self.video_path} ({self.fps:.1f} FPS)")
         ts_print(f"[REC] Timeline CSV metadata: {self.csv_path}")
 
     def write_frame(self, raw_clean_frame, fsm_state, pred_label, confidence, status):
-        if not self.is_recording or self.writer is None:
+        if not self.is_recording:
             return
 
-        # Write pristine camera frame (no HUD overlay!) for ML dataset training
-        self.writer.write(raw_clean_frame)
+        # Write clean camera frame for ML dataset training
+        if self.writer is not None:
+            self.writer.write(raw_clean_frame)
+
         self.frame_count += 1
 
         elapsed = time.time() - self.start_time
@@ -168,7 +171,6 @@ class SessionVideoRecorder:
             ])
 
         # Track timeline segments for auto-generating annotations for VIDEO.PY
-        # Strictly use confirmed FSM states so blocked hallucinations are never labeled as valid actions
         active_label = fsm_state if (fsm_state and fsm_state != "idle") else "idle"
         if active_label != self.current_segment_label:
             if self.frame_count > self.current_segment_start:
@@ -179,7 +181,7 @@ class SessionVideoRecorder:
     def toggle(self, frame_w, frame_h, fps=None):
         if self.is_recording:
             self.is_recording = False
-            ts_print(f"[REC] Recording PAUSED at frame {self.frame_count} ({self.video_path})")
+            ts_print(f"[REC] Recording PAUSED at frame {self.frame_count}")
         else:
             if self.writer is None:
                 self.start(frame_w, frame_h, fps)
@@ -404,7 +406,7 @@ class PhysicalCausalLogic:
             if self.blue_picked:
                 return False, "blue already in hand"
             # If blue_box is visible, verify hand reach. If occluded by hand grasp, allow pick!
-            if blue_box is not None and dist_blue > 0.50 and (containment is None or not containment.blue_is_held):
+            if blue_box is not None and dist_blue > 0.60 and (containment is None or not containment.blue_is_held):
                 return False, "hand not near blue object"
             return True, "ok"
 
@@ -1165,8 +1167,20 @@ def validate_yolo_detection(frame, rect, cls_name, pose_landmarks=None):
     area = (x2 - x1) * (y2 - y1)
     ar = (x2 - x1) / float(max(1, y2 - y1))
 
+    # ── Workspace Distance & Horizon Limit ──────────────────────────────────
+    # Active packaging happens on the table in the foreground / lower 75% of the camera.
+    # Distant background objects (clutter, shelves, objects on distant desks/walls)
+    # are physically outside the operator's reachable interaction zone.
+    if y2 < (img_h * 0.28):
+        # Entire detection is in the far upper background/horizon
+        return False
+
+    # Distant background objects appear tiny: reject tiny detections unless close to hand
+    if area < 600 and (y1 < img_h * 0.45):
+        return False
+
     # ── Torso & Upper-Body Exclusion Guard ───────────────────────────────────
-    # A desk box is located on the table, NEVER floating on the person's
+    # A desk box is located on the table or in hand, NEVER floating on the person's
     # chest, torso, neck, or shirt unless actively held in a hand.
     if pose_landmarks is not None and len(pose_landmarks.landmark) > 16:
         lms = pose_landmarks.landmark
@@ -1174,11 +1188,19 @@ def validate_yolo_detection(frame, rect, cls_name, pose_landmarks=None):
         cy = (y1 + y2) / 2.0
         
         # Check if wrist (lm 15 or 16) is grasping/touching the detection
-        wrist_dist = min(
+        wrist_dist_px = min(
             np.hypot(cx - lms[15].x * img_w, cy - lms[15].y * img_h),
             np.hypot(cx - lms[16].x * img_w, cy - lms[16].y * img_h)
         )
-        is_grasped = wrist_dist < (max(x2 - x1, y2 - y1) * 1.3 + 60)
+        is_grasped = wrist_dist_px < (max(x2 - x1, y2 - y1) * 1.3 + 60)
+
+        # Reachability Limit: Objects being interacted with must be within human reach!
+        # Distance between object and closest wrist or mid-body must be <= 65% of camera view
+        diag = np.hypot(img_w, img_h)
+        norm_wrist_dist = wrist_dist_px / diag
+        if norm_wrist_dist > 0.62:
+            # Object is too far away from the operator's hands (distant background object)
+            return False
 
         if not is_grasped:
             # 1. Above chest level (neck, chin, head, shoulders)
@@ -1460,8 +1482,9 @@ def process_frame(feat, motion, window, tar_model, stabilizer, spotter, now,
 
     # Path 2: Continuous Rolling Window (Telemetry + Auto-Idle Settling + Stable Latching)
     if len(window) == SEQ_LEN:
-        # Fast-path: When hands are motionless and already idle, bypass neural pass (saves 20+ ms)
-        if stabilizer.current_state == "idle" and motion < (MOTION_THRESHOLD * 0.70):
+        # Fast-path: When hands are motionless, already idle, and no active object is being held, bypass neural pass
+        has_active_box = (eff_red is not None and dist_red < 0.35) or (eff_blue is not None and dist_blue < 0.35)
+        if stabilizer.current_state == "idle" and motion < (MOTION_THRESHOLD * 0.70) and not has_active_box:
             idle_probs = np.zeros(NUM_CLASSES, dtype=np.float32)
             idle_probs[fu.LABELS.index("idle")] = 1.0
             raw_label, raw_conf, raw_probs = "idle", 1.0, idle_probs
@@ -1832,12 +1855,30 @@ def main():
             box_item = {"rect": rect, "area": rect[2] * rect[3], "score": det["conf"]}
             name = det["name"]
             cur_lms = pose_res.pose_landmarks if pose_res else None
-            if "red" in name and (yolo_red is None or det["conf"] > yolo_red["score"]):
+            if "red" in name:
                 if validate_yolo_detection(frame, rect, name, pose_landmarks=cur_lms):
-                    yolo_red = box_item
-            elif "blue" in name and (yolo_blue is None or det["conf"] > yolo_blue["score"]):
+                    # Prefer higher confidence unless already found close in foreground
+                    if yolo_red is None or det["conf"] > yolo_red["score"]:
+                        yolo_red = box_item
+            elif "blue" in name:
                 if validate_yolo_detection(frame, rect, name, pose_landmarks=cur_lms):
-                    yolo_blue = box_item
+                    # Proximity prioritization: when choosing between blue boxes, choose the one closest to hands/table foreground!
+                    if yolo_blue is None:
+                        yolo_blue = box_item
+                    else:
+                        # Compare vertical position (foreground is lower down, larger Y) and distance to wrists
+                        if cur_lms and len(cur_lms.landmark) > 16:
+                            cx1, cy1 = rect[0] + rect[2]/2.0, rect[1] + rect[3]/2.0
+                            old_r = yolo_blue["rect"]
+                            cx0, cy0 = old_r[0] + old_r[2]/2.0, old_r[1] + old_r[3]/2.0
+                            d1 = min(np.hypot(cx1 - cur_lms.landmark[15].x*frame.shape[1], cy1 - cur_lms.landmark[15].y*frame.shape[0]),
+                                     np.hypot(cx1 - cur_lms.landmark[16].x*frame.shape[1], cy1 - cur_lms.landmark[16].y*frame.shape[0]))
+                            d0 = min(np.hypot(cx0 - cur_lms.landmark[15].x*frame.shape[1], cy0 - cur_lms.landmark[15].y*frame.shape[0]),
+                                     np.hypot(cx0 - cur_lms.landmark[16].x*frame.shape[1], cy0 - cur_lms.landmark[16].y*frame.shape[0]))
+                            if d1 < d0:
+                                yolo_blue = box_item
+                        elif det["conf"] > yolo_blue["score"]:
+                            yolo_blue = box_item
             elif "main" in name or "box" in name:
                 if yolo_main is None or det["conf"] > yolo_main["score"]:
                     if validate_yolo_detection(frame, rect, name, pose_landmarks=cur_lms):
@@ -1914,14 +1955,6 @@ def main():
             if result['current_state'] in ("close_box", "open_box"):
                 containment.reset()
 
-        # Record clean raw frame and timeline metadata for dataset training
-        recorder.write_frame(
-            clean_raw_frame,
-            fsm_state=result.get("current_state"),
-            pred_label=result.get("predicted_label"),
-            confidence=result.get("confidence", 0.0),
-            status=result.get("status", "")
-        )
 
         # --- Minimal HUD: Left Side (State + Diagnostic Telemetry) ---
         state_text = result['current_state'] or "idle"
@@ -2020,7 +2053,16 @@ def main():
             cv2.rectangle(frame, (bx0, by0), (bx0 + banner_w, by0 + 36), (20, 20, 20), -1)
             cv2.rectangle(frame, (bx0, by0), (bx0 + banner_w, by0 + 36), feedback_banner_color, 2)
             cv2.putText(frame, feedback_banner, (bx0 + 15, by0 + 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, feedback_banner_color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+
+        # Record clean raw frame for ML dataset training
+        recorder.write_frame(
+            clean_raw_frame,
+            fsm_state=result.get("current_state"),
+            pred_label=result.get("predicted_label"),
+            confidence=result.get("confidence", 0.0),
+            status=result.get("status", "")
+        )
 
         cv2.imshow("Realtime HAR", frame)
 

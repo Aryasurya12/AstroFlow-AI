@@ -121,8 +121,8 @@ SOP_STEPS = [
     ("close_box", "6. Close Box"),
 ]
 
-DEFAULT_MODEL_PATH = "best_tar_model1.pth" if os.path.exists(os.path.join(PROJECT_ROOT, "best_tar_model1.pth")) else "best_tar_model.pth"
-DEFAULT_YOLO_PATH = "yolo_boxes.pt"
+DEFAULT_MODEL_PATH = "models/best_tar_model.pth" if os.path.exists(os.path.join(PROJECT_ROOT, "models", "best_tar_model.pth")) else ("best_tar_model1.pth" if os.path.exists(os.path.join(PROJECT_ROOT, "best_tar_model1.pth")) else "best_tar_model.pth")
+DEFAULT_YOLO_PATH = "models/yolo_boxes.pt" if os.path.exists(os.path.join(PROJECT_ROOT, "models", "yolo_boxes.pt")) else "yolo_boxes.pt"
 
 
 # ==============================================================================

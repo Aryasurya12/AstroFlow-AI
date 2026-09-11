@@ -21,6 +21,7 @@ videos/
 session_logs/
 test_reports/
 implementation_plan.md
+scratch/
 
 # Large pretrained/fold weights (keep best_tar_model.pth and yolo_boxes.pt)
 fold_*_model.pth
