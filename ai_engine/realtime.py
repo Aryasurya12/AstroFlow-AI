@@ -552,6 +552,10 @@ class DecisionStabilizer:
         self.release_counter_red = 0
         self.release_counter_blue = 0
 
+        # Motion-triggered and timed SOP transitions (3 to 4 sec)
+        self.motion_start_time = 0.0          # Tracks when motion started from idle
+        self.blue_in_confirm_time = 0.0       # Tracks when place_blue_in occurred
+
     def check_operator_mistake(self, raw_label, raw_conf, expected_action, now,
                                 containment=None, red_box=None, blue_box=None, main_box=None,
                                 dist_red=999.0, dist_blue=999.0, dist_main=999.0):
@@ -707,11 +711,49 @@ class DecisionStabilizer:
                     self.last_action_state = candidate
                     self.recent.clear()
                     self.causal_logic.apply_transition(candidate)
+                    self.blue_in_confirm_time = now
                     self.last_rejected_reason = "physics: blue placed in box"
                     ts_print(f"[PHYSICS EVENT] -> place_blue_in (Hands empty, blue placed in box)")
                     return True, self.current_state, candidate, 0.95, "physics: blue placed in box"
             else:
                 self.release_counter_blue = 0
+
+        # 3c. Automatic Motion-Triggered Open Box (Within 3 to 4 seconds of movement)
+        if self.use_fsm and not self.causal_logic.box_open and (expected_action in ("open_box", None)):
+            if motion >= (MOTION_THRESHOLD * 0.70):
+                if self.motion_start_time == 0.0:
+                    self.motion_start_time = now
+                elif (now - self.motion_start_time) >= 3.5:
+                    self.motion_start_time = 0.0
+                    candidate = "open_box"
+                    self.current_state = candidate
+                    self.last_change_time = now
+                    self.dwell_until = now + self.dwell_sec
+                    self.last_action_state = candidate
+                    self.recent.clear()
+                    self.causal_logic.apply_transition(candidate)
+                    self.last_rejected_reason = "timed: 3.5s motion confirmed open_box"
+                    ts_print(f"[PROCEDURE EVENT] -> open_box (3.5s motion detected, container opened)")
+                    return True, self.current_state, candidate, 0.95, "timed: 3.5s motion confirmed open_box"
+            else:
+                self.motion_start_time = 0.0
+
+        # 3d. Automatic Close Box After Blue Placed In (Within 3 to 4 seconds)
+        if self.use_fsm and self.causal_logic.blue_placed_in and self.causal_logic.box_open:
+            if self.blue_in_confirm_time == 0.0:
+                self.blue_in_confirm_time = now
+            elif (now - self.blue_in_confirm_time) >= 3.5:
+                self.blue_in_confirm_time = 0.0
+                candidate = "close_box"
+                self.current_state = candidate
+                self.last_change_time = now
+                self.dwell_until = now + self.dwell_sec
+                self.last_action_state = candidate
+                self.recent.clear()
+                self.causal_logic.apply_transition(candidate)
+                self.last_rejected_reason = "timed: 3.5s after blue in confirmed close_box"
+                ts_print(f"[PROCEDURE EVENT] -> close_box (3.5s after blue in, container closed)")
+                return True, self.current_state, candidate, 0.95, "timed: 3.5s after blue in confirmed close_box"
 
         # 4. Motion Gate: non-idle actions require actual physical movement
         if predicted_class != IDLE_LABEL and motion < MOTION_THRESHOLD:
@@ -833,8 +875,14 @@ class DecisionStabilizer:
         if candidate != "idle":
             self.dwell_until = now + self.dwell_sec
             self.last_action_state = candidate   # track physical SOP progress (never reset by idle-settle)
-        self.recent.clear()
         self.causal_logic.apply_transition(candidate)
+        if candidate == "place_blue_in":
+            self.blue_in_confirm_time = now
+        elif candidate == "close_box":
+            self.blue_in_confirm_time = 0.0
+            self.motion_start_time = 0.0
+        elif candidate == "open_box":
+            self.motion_start_time = 0.0
         self.last_rejected_reason = "accepted"
         return True, self.current_state, candidate, confidence, self.last_rejected_reason
 
@@ -905,6 +953,13 @@ class DecisionStabilizer:
         self.last_action_state = cand   # keep skip-alert tracker in sync (same as update() path)
         self.recent.clear()
         self.causal_logic.apply_transition(cand)
+        if cand == "place_blue_in":
+            self.blue_in_confirm_time = now
+        elif cand == "close_box":
+            self.blue_in_confirm_time = 0.0
+            self.motion_start_time = 0.0
+        elif cand == "open_box":
+            self.motion_start_time = 0.0
         self.last_rejected_reason = "accepted (spotted)"
         return True, self.current_state, cand, conf, "accepted (spotted)"
 
@@ -1200,20 +1255,28 @@ def validate_yolo_detection(frame, rect, cls_name, pose_landmarks=None):
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
         
-        # Check if wrist (lm 15 or 16) is grasping/touching the detection
-        wrist_dist_px = min(
-            np.hypot(cx - lms[15].x * img_w, cy - lms[15].y * img_h),
-            np.hypot(cx - lms[16].x * img_w, cy - lms[16].y * img_h)
-        )
-        is_grasped = wrist_dist_px < (max(x2 - x1, y2 - y1) * 1.3 + 60)
+        # Check if wrist (lm 15 or 16) is grasping/touching the detection perimeter (NOT center!)
+        wrist_dist_px = 999.0
+        for wi in (15, 16):
+            wx, wy = lms[wi].x * img_w, lms[wi].y * img_h
+            dx = max(0, max(x1 - wx, wx - x2))
+            dy = max(0, max(y1 - wy, wy - y2))
+            d = np.hypot(dx, dy)
+            if d < wrist_dist_px:
+                wrist_dist_px = d
+        is_grasped = wrist_dist_px <= 45.0
 
         # Reachability Limit: Objects being interacted with must be within human reach!
-        # Distance between object and closest wrist or mid-body must be <= 65% of camera view
         diag = np.hypot(img_w, img_h)
         norm_wrist_dist = wrist_dist_px / diag
         if norm_wrist_dist > 0.62:
             # Object is too far away from the operator's hands (distant background object)
             return False
+
+        # Sub-boxes (Choco Pie / Cadbury Silk) cannot be giant
+        if "red" in cls_name or "blue" in cls_name:
+            if (x2 - x1) > 280 or (y2 - y1) > 280 or area > 35000:
+                return False
 
         if not is_grasped:
             # 1. Above chest level (neck, chin, head, shoulders)
@@ -1225,16 +1288,20 @@ def validate_yolo_detection(frame, rect, cls_name, pose_landmarks=None):
             body_xs = [lms[i].x * img_w for i in [11, 12, 13, 14] if lms[i].visibility > 0.1]
             if not body_xs:
                 body_xs = [lms[11].x * img_w, lms[12].x * img_w]
-            torso_x_min = min(body_xs) - 80
-            torso_x_max = max(body_xs) + 80
+            torso_x_min = min(body_xs) - 40
+            torso_x_max = max(body_xs) + 40
 
-            if torso_x_min <= cx <= torso_x_max and cy >= (shoulder_y - 20):
+            if torso_x_min <= cx <= torso_x_max and cy <= (shoulder_y + img_h * 0.28):
+                return False
+
+            # 3. Floor / Bottom Corner Rejection: sub-boxes far from active hand interaction
+            if wrist_dist_px > 300.0 and (y2 > img_h * 0.82 or x1 < img_w * 0.12 or x2 > img_w * 0.88):
                 return False
 
     if "red" in cls_name:
-        # Lotte Choco Pie Box: Vivid scarlet packaging (S >= 155 completely separates skin)
-        # Red box on desk cannot be a tall narrow vertical strip like an arm (ar < 0.55)
-        if area < 800 or ar < 0.55 or ar > 2.6:
+        # Lotte Choco Pie Box: Vivid scarlet packaging (S >= 100, V >= 70)
+        # Red box on desk cannot be a tall narrow vertical strip like an arm (ar < 0.50)
+        if area < 700 or ar < 0.50 or ar > 2.8:
             return False
 
         # Reject detection if aligned with human arm landmarks
@@ -1247,24 +1314,32 @@ def validate_yolo_detection(frame, rect, cls_name, pose_landmarks=None):
                     return False
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # S >= 155 separates glossy red packaging from skin (skin max S ~ 130)
-        m1_hi = cv2.inRange(hsv, np.array([0, 155, 80]), np.array([10, 255, 255]))
-        m2_hi = cv2.inRange(hsv, np.array([170, 155, 80]), np.array([180, 255, 255]))
+        # S >= 135, V >= 60 isolates scarlet packaging from skin (skin S < 125) and shadows
+        m1_hi = cv2.inRange(hsv, np.array([0, 135, 60]), np.array([14, 255, 255]))
+        m2_hi = cv2.inRange(hsv, np.array([168, 135, 60]), np.array([180, 255, 255]))
         hi_sat_pixels = cv2.countNonZero(m1_hi | m2_hi)
-        return (hi_sat_pixels / float(area)) >= 0.30
+        return (hi_sat_pixels / float(area)) >= 0.16
 
     elif "blue" in cls_name:
-        # Cadbury Dairy Milk Silk: Royal blue to deep purple/violet (Hue 95-165, S >= 35, V >= 25)
-        # Relaxed area & aspect ratio so hand occlusion and grasping don't discard detection
-        if area < 450 or ar < 0.25 or ar > 3.5:
+        # Cadbury Dairy Milk Silk: Royal navy blue & purple packaging (Hue 112-170, S >= 48, V >= 28)
+        # Strictly separates Cadbury Silk packaging from pale blue/cyan/sky blue shirts (Hue 95-110)
+        if area < 400 or ar < 0.25 or ar > 3.5:
             return False
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([95, 35, 25]), np.array([165, 255, 255]))
+        mask = cv2.inRange(hsv, np.array([112, 48, 28]), np.array([170, 255, 255]))
         # 8% minimum color density accounts for logo, text, graphics, and grasping hand
         return (cv2.countNonZero(mask) / float(area)) >= 0.08
 
     elif "main" in cls_name or "box" in cls_name:
-        return area > 1800
+        # Main box validation:
+        # Reject ceiling lights / fixtures
+        if y2 < (img_h * 0.32) or (y1 < img_h * 0.10 and y2 < img_h * 0.45):
+            return False
+        # Reject narrow vertical slivers (doorway pillar) and extreme wide strips
+        if ar < 0.40 or ar > 2.8:
+            return False
+        # Main box must have substantial area
+        return area > 3000
 
     return True
 
