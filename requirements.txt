@@ -1,0 +1,13 @@
+numpy>=1.24.0,<2.0.0
+mediapipe==0.10.14
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+torch
+torchvision
+fastapi
+uvicorn[standard]
+websockets
+pyttsx3
+pygrabber
+python-multipart
+requests
