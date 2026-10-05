@@ -660,27 +660,29 @@ export function useTelemetryStream() {
 
       if (curState !== "idle") {
         avionicsAudio.playAcceptedTone();
-        appendLog({
-          timestamp: timeStr,
-          level: "ACCEPTED",
-          state: curState,
-          reason: `STATE → ${curState.toUpperCase()} (conf ${conf.toFixed(2)})`,
-          confidence: conf,
-        });
+        window.setTimeout(() => {
+          appendLog({
+            timestamp: timeStr,
+            level: "ACCEPTED",
+            state: curState,
+            reason: `STATE → ${curState.toUpperCase()} (conf ${conf.toFixed(2)})`,
+            confidence: conf,
+          });
 
-        if (curState === "open_box") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Main Stowage Box latch released [OPEN]", confidence: 0.99 });
-        } else if (curState === "pick_red") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Red Cube [Sample-A] grasp confirmed [HELD]", confidence: 0.95 });
-        } else if (curState === "place_red_out") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Red Cube [Sample-A] deposited on exterior workbench [OUTSIDE]", confidence: 0.96 });
-        } else if (curState === "pick_blue") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Blue Cube [Sample-B] grasp confirmed [HELD]", confidence: 0.93 });
-        } else if (curState === "place_blue_in") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Blue Cube [Sample-B] inserted into stowage interior [INSIDE]", confidence: 0.97 });
-        } else if (curState === "close_box") {
-          appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Main Stowage Box lid engaged and sealed [CLOSED]", confidence: 0.99 });
-        }
+          if (curState === "open_box") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Main Stowage Box latch released [OPEN]", confidence: 0.99 });
+          } else if (curState === "pick_red") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Red Cube [Sample-A] grasp confirmed [HELD]", confidence: 0.95 });
+          } else if (curState === "place_red_out") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Red Cube [Sample-A] deposited on exterior workbench [OUTSIDE]", confidence: 0.96 });
+          } else if (curState === "pick_blue") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Blue Cube [Sample-B] grasp confirmed [HELD]", confidence: 0.93 });
+          } else if (curState === "place_blue_in") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Blue Cube [Sample-B] inserted into stowage interior [INSIDE]", confidence: 0.97 });
+          } else if (curState === "close_box") {
+            appendLog({ timestamp: timeStr, level: "CONTAINMENT", state: curState, reason: "CONTAINMENT: Main Stowage Box lid engaged and sealed [CLOSED]", confidence: 0.99 });
+          }
+        }, 0);
       }
     }
     prevLiveStateRef.current = curState;
